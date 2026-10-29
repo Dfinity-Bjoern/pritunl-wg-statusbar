@@ -1,8 +1,8 @@
 # Pritunl WG
 
-A macOS status bar app for DFINITY's Pritunl VPN, wrapping [`pritunl-wg`](../pritunl-wg/README.md).
+A macOS status bar app for DFINITY's Pritunl VPN. The shield icon in your menu bar turns **green** when connected, **yellow** while connecting, and **red** when disconnected. One click to connect or disconnect.
 
-The shield icon in your menu bar turns **green** when connected, **yellow** while connecting, and **red** when disconnected. One click to connect or disconnect.
+Bundled in `Resources/`: the `pritunl-wg` Python script that handles WireGuard key exchange with the Pritunl server, and `install.sh` that sets up the Python venv, installs the script, and registers the launchd service. No separate download needed.
 
 ## Prerequisites
 
@@ -86,7 +86,7 @@ pritunl-wg log
 
 ```bash
 # Remove the VPN service and all installed files:
-bash /tmp/pritunl-wg-install/install.sh --uninstall
+bash Resources/install.sh --uninstall
 
 # Remove the app:
 rm -rf /Applications/PritunlWG.app
