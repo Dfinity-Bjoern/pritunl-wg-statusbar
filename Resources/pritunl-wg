@@ -52,7 +52,11 @@ STATUS_PATH = "/var/run/pritunl-wg.status"
 LOG_PATH = "/var/log/pritunl-wg.log"
 LABEL = "local.pritunl-wg"
 PLIST_PATH = "/Library/LaunchDaemons/%s.plist" % LABEL
-BREW_PREFIXES = ["/opt/homebrew", "/usr/local"]
+# wireguard-tools from Nix (nix-darwin's system profile or the default profile)
+# or Homebrew; the root-owned Nix profiles come first. Keep in sync with
+# Resources/install.sh and Sources/VPNController.swift.
+TOOL_DIRS = ["/run/current-system/sw/bin", "/nix/var/nix/profiles/default/bin",
+             "/opt/homebrew/bin", "/usr/local/bin"]
 
 log = logging.getLogger("pritunl-wg")
 
@@ -82,12 +86,21 @@ def rand_str(n):
     return "".join(secrets.choice(alphabet) for _ in range(n))
 
 
-def find_brew_bin(name):
-    for prefix in BREW_PREFIXES:
-        p = os.path.join(prefix, "bin", name)
-        if os.path.exists(p):
+def tool_path(name):
+    for d in TOOL_DIRS:
+        p = os.path.join(d, name)
+        if os.access(p, os.X_OK):
             return p
-    raise SystemExit("Could not find %s - run: brew install wireguard-tools" % name)
+    return None
+
+
+def find_tool(name):
+    p = tool_path(name)
+    if not p:
+        raise SystemExit("Could not find %s in %s - install wireguard-tools with "
+                         "Homebrew or system-wide with Nix (e.g. nix-darwin's "
+                         "environment.systemPackages)" % (name, ", ".join(TOOL_DIRS)))
+    return p
 
 
 def write_status(**kw):
@@ -390,13 +403,14 @@ def build_wg_conf(conf, priv64):
 
 
 def wg_quick(action):
-    bash = find_brew_bin("bash")
-    wgq = find_brew_bin("wg-quick")
+    wgq = find_tool("wg-quick")
     env = dict(os.environ)
-    env["PATH"] = ":".join([os.path.join(p, "bin") for p in BREW_PREFIXES] +
+    # wg-quick needs bash 4+: Homebrew's finds it in its own directory through
+    # "#!/usr/bin/env bash", Nix's names it in its shebang.
+    env["PATH"] = ":".join([os.path.dirname(wgq)] + TOOL_DIRS +
                            ["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
     env.setdefault("HOME", "/var/root")
-    p =subprocess.run([bash, wgq, action, WG_CONF_PATH], env=env,
+    p = subprocess.run([wgq, action, WG_CONF_PATH], env=env,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in p.stdout.splitlines():
         log.debug("wg-quick %s: %s", action, line)
@@ -511,6 +525,13 @@ def cmd_run(_args):
     prof = Profile(PROFILE_PATH)
     log.info("pritunl-wg %s starting for %s on %s", VERSION, prof.user,
              prof.server_name)
+    # At boot launchd can start us before Nix's /nix volume is mounted.
+    if not tool_path("wg-quick"):
+        log.info("Waiting for wg-quick (at boot /nix may not be mounted yet)")
+        write_status(state="connecting", server=prof.server_name, user=prof.user)
+    deadline = time.monotonic() + 60
+    while not STOP and not tool_path("wg-quick") and time.monotonic() < deadline:
+        sleep_interruptible(1)
     tunnel_down()  # clean up leftovers from a crash
     backoff = 3
     while not STOP:

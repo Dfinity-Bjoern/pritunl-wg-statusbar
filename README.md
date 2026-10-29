@@ -7,8 +7,8 @@ Bundled in `Resources/`: the `pritunl-wg` Python script that handles WireGuard k
 ## Prerequisites
 
 - macOS 13 or later
-- [Homebrew](https://brew.sh) — the app installs `wireguard-tools` for you on first use
-- Xcode Command Line Tools — only needed if you build from source:
+- `wireguard-tools` — with [Homebrew](https://brew.sh) the app installs it for you on first use; with Nix, install it system-wide, for example in nix-darwin's `environment.systemPackages` (per-user installs such as home-manager's `home.packages` aren't used, because the VPN service runs as root)
+- Xcode Command Line Tools — setup uses their `python3`, and `build.sh` their Swift compiler:
   ```
   xcode-select --install
   ```
@@ -30,11 +30,41 @@ Download `PritunlWG.zip` from the latest release, unzip, and drag `PritunlWG.app
 
 **First launch on a colleague's machine:** macOS will block the app because it is not notarized. Right-click (or Control-click) `PritunlWG.app` → **Open** → **Open** to allow it. You only need to do this once.
 
+### Option C: build with Nix
+
+With [Nix](https://nixos.org) (flakes enabled) you can build the app without the Xcode Command Line Tools or a clone of this repo (setup still uses their `python3`). The app it builds requires macOS 14 or later, the oldest version Nixpkgs supports.
+
+```bash
+nix build github:Dfinity-Bjoern/pritunl-wg-statusbar   # or `nix build` in a clone
+rm -rf /Applications/PritunlWG.app                      # remove an older copy (quit the app first)
+cp -R result/Applications/PritunlWG.app /Applications/
+chmod -R u+w /Applications/PritunlWG.app                # files copied from the Nix store are read-only
+open /Applications/PritunlWG.app
+```
+
+With [nix-darwin](https://github.com/nix-darwin/nix-darwin), install the package from your system flake instead; nix-darwin copies the app to `/Applications/Nix Apps`. Add the input to your `flake.nix`:
+
+```nix
+inputs = {
+  # ...
+  pritunl-wg-statusbar.url = "github:Dfinity-Bjoern/pritunl-wg-statusbar";
+  pritunl-wg-statusbar.inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+Then add `pritunl-wg-statusbar` to the arguments of `outputs`, and the package to your configuration:
+
+```nix
+environment.systemPackages = [
+  pritunl-wg-statusbar.packages.${pkgs.stdenv.hostPlatform.system}.default
+];
+```
+
 ## First-time setup
 
 1. Export your profile from the Pritunl web console: **Servers → your server → Export** — you will get a `.tar` file.
 2. Click the shield icon in the menu bar → **Import Profile…** and select that `.tar` file (or a `.ovpn` if you have one directly).
-3. You will be asked for your administrator password once. The app installs the `wireguard-tools` Homebrew package, sets up the VPN service, and stores your profile at `/etc/pritunl-wg/profile.ovpn` (readable by root only).
+3. You will be asked for your administrator password once. The app installs the `wireguard-tools` Homebrew package if `wg-quick` isn't installed yet, sets up the VPN service, and stores your profile at `/etc/pritunl-wg/profile.ovpn` (readable by root only).
 4. Click **Connect**.
 
 ## Passwordless connect / disconnect
@@ -86,9 +116,11 @@ pritunl-wg log
 
 ```bash
 # Remove the VPN service and all installed files:
-bash Resources/install.sh --uninstall
+bash /Applications/PritunlWG.app/Contents/Resources/install.sh --uninstall
+# or, with nix-darwin:
+bash "/Applications/Nix Apps/PritunlWG.app/Contents/Resources/install.sh" --uninstall
 
-# Remove the app:
+# Remove the app (with nix-darwin: remove it from environment.systemPackages):
 rm -rf /Applications/PritunlWG.app
 
 # Remove the sudoers rule (if you set it up):

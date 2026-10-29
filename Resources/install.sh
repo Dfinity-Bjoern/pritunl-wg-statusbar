@@ -14,6 +14,18 @@ LABEL=local.pritunl-wg
 PLIST=/Library/LaunchDaemons/$LABEL.plist
 LOG=/var/log/pritunl-wg.log
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# wireguard-tools from Nix (nix-darwin's system profile or the default profile)
+# or Homebrew; the root-owned Nix profiles come first. Keep in sync with
+# Resources/pritunl-wg and Sources/VPNController.swift.
+TOOL_DIRS=(/run/current-system/sw/bin /nix/var/nix/profiles/default/bin /opt/homebrew/bin /usr/local/bin)
+
+find_wg_quick() {
+  local d
+  for d in "${TOOL_DIRS[@]}"; do
+    if [[ -x $d/wg-quick ]]; then echo "$d/wg-quick"; return 0; fi
+  done
+  return 1
+}
 
 # ------------------------------------------------------------------ root phase
 # Everything that needs root runs here, in a single sudo invocation.
@@ -76,13 +88,9 @@ fi
 if [[ "${1:-}" == "--root-uninstall" ]]; then
   launchctl bootout system/$LABEL 2>/dev/null || true
   launchctl disable system/$LABEL 2>/dev/null || true
-  if [[ -f "$CONF/dfinity.conf" ]]; then
-    for p in /opt/homebrew /usr/local; do
-      if [[ -x $p/bin/wg-quick ]]; then
-        PATH="$p/bin:$PATH" "$p/bin/bash" "$p/bin/wg-quick" down "$CONF/dfinity.conf" || true
-        break
-      fi
-    done
+  if [[ -f "$CONF/dfinity.conf" ]] && WG_QUICK=$(find_wg_quick); then
+    # Homebrew's wg-quick finds its bash 4+ on PATH, Nix's names it in its shebang.
+    PATH="${WG_QUICK%/*}:$PATH" "$WG_QUICK" down "$CONF/dfinity.conf" || true
   fi
   rm -rf "$LIB" "$BIN" "$CONF" "$PLIST" /etc/newsyslog.d/pritunl-wg.conf \
          /var/run/pritunl-wg.status
@@ -97,7 +105,7 @@ fi
 if [[ "${1:-}" == "--uninstall" ]]; then
   echo "==> Removing pritunl-wg (asks for your password once)"
   sudo /bin/bash "$HERE/install.sh" --root-uninstall
-  echo "Removed. (wireguard-tools stays installed: brew uninstall wireguard-tools)"
+  echo "Removed. (wireguard-tools stays installed; with Homebrew: brew uninstall wireguard-tools)"
   exit 0
 fi
 
@@ -106,11 +114,14 @@ if [[ -z "$SRC" || ! -f "$SRC" ]]; then
   echo "Usage: bash install.sh <profile.tar | profile.ovpn>" >&2; exit 1
 fi
 
-if ! command -v brew >/dev/null; then
-  echo "Homebrew is required: https://brew.sh" >&2; exit 1
+if ! find_wg_quick >/dev/null; then
+  if ! command -v brew >/dev/null; then
+    echo "wireguard-tools is required: install Homebrew (https://brew.sh), or install" \
+         "wireguard-tools system-wide with Nix (e.g. nix-darwin's environment.systemPackages)" >&2; exit 1
+  fi
+  echo "==> Installing wireguard-tools via Homebrew"
+  brew install wireguard-tools
 fi
-echo "==> Installing wireguard-tools via Homebrew"
-brew list wireguard-tools >/dev/null 2>&1 || brew install wireguard-tools
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 case "$SRC" in

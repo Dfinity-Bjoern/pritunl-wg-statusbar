@@ -4,6 +4,11 @@ import Foundation
 private let pritunlBin = "/usr/local/bin/pritunl-wg"
 private let sudoersPath = "/etc/sudoers.d/pritunl-wg"
 private let sudoersContent = "%admin ALL=(ALL) NOPASSWD: /usr/local/bin/pritunl-wg up, /usr/local/bin/pritunl-wg down"
+// wireguard-tools from Nix (nix-darwin's system profile or the default profile)
+// or Homebrew; the root-owned Nix profiles come first. Keep in sync with
+// Resources/pritunl-wg and Resources/install.sh.
+private let toolDirs = ["/run/current-system/sw/bin", "/nix/var/nix/profiles/default/bin",
+                        "/opt/homebrew/bin", "/usr/local/bin"]
 
 class VPNController {
 
@@ -77,12 +82,11 @@ class VPNController {
     }
 
     private func ensureWireguardTools() throws {
-        let wgPaths = ["/opt/homebrew/bin/wg-quick", "/usr/local/bin/wg-quick"]
-        if wgPaths.contains(where: { FileManager.default.fileExists(atPath: $0) }) { return }
+        if toolDirs.contains(where: { FileManager.default.isExecutableFile(atPath: $0 + "/wg-quick") }) { return }
 
         let brewPaths = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
         guard let brew = brewPaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
-            throw fail("Homebrew not found. Install it from https://brew.sh, then try again.")
+            throw fail("wireguard-tools not found. Install Homebrew (https://brew.sh), or install wireguard-tools system-wide with Nix (e.g. nix-darwin's environment.systemPackages), then try again.")
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: brew)
