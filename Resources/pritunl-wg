@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""
+pritunl-wg - a small WireGuard client for Pritunl servers on macOS.
+
+Implements the same key exchange the official Pritunl client uses in
+WireGuard mode (POST /key/wg/... to register a fresh WireGuard key, then
+PUT /key/wg/... through the tunnel as a keepalive), and runs the tunnel
+with the standard wireguard-tools (wg-quick + wireguard-go).
+
+Commands:
+  sudo pritunl-wg up        start the VPN (background service, survives reboot)
+  sudo pritunl-wg down      stop the VPN
+  pritunl-wg status         show connection status
+  pritunl-wg log            follow the log
+  sudo pritunl-wg run       run in the foreground (used by the service)
+"""
+
+import argparse
+import base64
+import hashlib
+import hmac
+import ipaddress
+import json
+import logging
+import os
+import random
+import secrets
+import signal
+import ssl
+import string
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
+from nacl.public import Box, PrivateKey, PublicKey
+from nacl.utils import random as nacl_random
+
+VERSION = "1.0.0"
+CONF_DIR = "/etc/pritunl-wg"
+PROFILE_PATH = os.path.join(CONF_DIR, "profile.ovpn")
+DEVICE_ID_PATH = os.path.join(CONF_DIR, "device_id")
+IFACE_NAME = "dfinity"  # wg-quick maps this to a utunN interface
+WG_CONF_PATH = os.path.join(CONF_DIR, IFACE_NAME + ".conf")
+STATUS_PATH = "/var/run/pritunl-wg.status"
+LOG_PATH = "/var/log/pritunl-wg.log"
+LABEL = "local.pritunl-wg"
+PLIST_PATH = "/Library/LaunchDaemons/%s.plist" % LABEL
+BREW_PREFIXES = ["/opt/homebrew", "/usr/local"]
+
+log = logging.getLogger("pritunl-wg")
+
+
+class AuthError(Exception):
+    """Server rejected us; retrying immediately will not help."""
+
+
+class RequestFailed(Exception):
+    def __init__(self, msg, final=False):
+        super().__init__(msg)
+        self.final = final
+
+
+# ---------------------------------------------------------------- helpers
+
+def b64e(b):
+    return base64.b64encode(b).decode()
+
+
+def b64d(s):
+    return base64.b64decode(s)
+
+
+def rand_str(n):
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def find_brew_bin(name):
+    for prefix in BREW_PREFIXES:
+        p = os.path.join(prefix, "bin", name)
+        if os.path.exists(p):
+            return p
+    raise SystemExit("Could not find %s - run: brew install wireguard-tools" % name)
+
+
+def write_status(**kw):
+    kw["updated"] = int(time.time())
+    try:
+        tmp = STATUS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(kw, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATUS_PATH)
+    except OSError:
+        pass
+
+
+def insecure_ctx():
+    # The official client also skips TLS verification (Pritunl commonly uses
+    # self-signed certs, and keepalives go to the tunnel gateway IP). Every
+    # response is authenticated with an HMAC keyed by the profile's sync
+    # secret and NaCl-box encrypted to our ephemeral key, which we verify.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+# ---------------------------------------------------------------- profile
+
+class Profile(object):
+    def __init__(self, path):
+        with open(path) as f:
+            text = f.read()
+        header = []
+        key_lines = []
+        in_key = False
+        self.remotes = []
+        in_header = True
+        for line in text.splitlines():
+            if in_header and line.startswith("#"):
+                header.append(line[1:])
+                continue
+            in_header = False
+            if line.startswith("#"):
+                continue
+            elif line.strip() == "<key>":
+                in_key = True
+            elif line.strip() == "</key>":
+                in_key = False
+            elif in_key:
+                key_lines.append(line)
+            elif line.startswith("remote "):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] not in self.remotes:
+                    self.remotes.append(parts[1])
+        if not header:
+            raise SystemExit("Profile has no Pritunl header: %s" % path)
+        meta = json.loads("\n".join(header))
+        self.meta = meta
+        self.org_id = meta["organization_id"]
+        self.user_id = meta["user_id"]
+        self.server_id = meta["server_id"]
+        self.server_name = meta.get("server", "")
+        self.user = meta.get("user", "")
+        self.sync_token = meta["sync_token"]
+        self.sync_secret = meta["sync_secret"].encode()
+        self.server_box_key = PublicKey(b64d(meta["server_box_public_key"]))
+        self.sync_hosts = meta.get("sync_hosts") or []
+        if not meta.get("wg"):
+            log.warning("Profile does not have WireGuard enabled ('wg': false)")
+        for flag in ("sso_auth", "device_auth", "push_auth"):
+            if meta.get(flag):
+                raise SystemExit(
+                    "Profile requires %s, which pritunl-wg does not support" % flag)
+        if meta.get("password_mode"):
+            raise SystemExit("Profile requires a password/PIN/OTP, which "
+                             "pritunl-wg does not support yet")
+        self.rsa_key = serialization.load_pem_private_key(
+            ("\n".join(key_lines) + "\n").encode(), password=None)
+
+    def api_hosts(self):
+        hosts = []
+        for h in self.sync_hosts:
+            u = urllib.parse.urlparse(h)
+            if u.netloc and u.netloc not in hosts:
+                hosts.append(u.netloc)
+        for r in self.remotes:
+            if r not in hosts:
+                hosts.append(r)
+        return hosts
+
+    def path(self):
+        return "/key/wg/%s/%s/%s" % (self.org_id, self.user_id, self.server_id)
+
+
+# ---------------------------------------------------------------- protocol
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface redirects as HTTPError so we can re-send POST/PUT ourselves."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def enc_request(prof, method, url, payload, timeout=40):
+    """Send a Pritunl-style encrypted+signed request and return decrypted JSON."""
+    eph = PrivateKey.generate()
+    box = Box(eph, prof.server_box_key)
+    nonce = nacl_random(Box.NONCE_SIZE)
+    ct = box.encrypt(json.dumps(payload).encode(), nonce).ciphertext
+
+    data64 = b64e(ct)
+    nonce64 = b64e(nonce)
+    pub64 = b64e(bytes(eph.public_key))
+    digest = hashlib.sha512("&".join([data64, nonce64, pub64]).encode()).digest()
+    sig64 = b64e(prof.rsa_key.sign(
+        digest,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA512()),
+                    salt_length=padding.PSS.MAX_LENGTH),
+        Prehashed(hashes.SHA512()),
+    ))
+    body = {"data": data64, "nonce": nonce64, "public_key": pub64,
+            "signature": sig64}
+
+    ts = str(int(time.time()))
+    auth_nonce = rand_str(32)
+    path = urllib.parse.urlparse(url).path
+    auth_str = "&".join([prof.sync_token, ts, auth_nonce, method, path,
+                         data64, nonce64, pub64, sig64])
+    auth_sig = b64e(hmac.new(prof.sync_secret, auth_str.encode(),
+                             hashlib.sha512).digest())
+
+    headers = {
+        "User-Agent": "pritunl-client",
+        "Content-Type": "application/json",
+        "Auth-Token": prof.sync_token,
+        "Auth-Timestamp": ts,
+        "Auth-Nonce": auth_nonce,
+        "Auth-Signature": auth_sig,
+    }
+    payload_bytes = json.dumps(body).encode()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=insecure_ctx()), _NoRedirect())
+    target = url
+    for _hop in range(6):
+        req = urllib.request.Request(target, data=payload_bytes,
+                                     method=method, headers=headers)
+        try:
+            with opener.open(req, timeout=timeout) as res:
+                resp = json.loads(res.read().decode())
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
+                # Like Go's net/http (used by the official client): follow
+                # 307/308 with the same method, body and headers.
+                nxt = urllib.parse.urljoin(target, e.headers["Location"])
+                log.info("HTTP %d redirect: %s -> %s", e.code, target, nxt)
+                target = nxt
+                continue
+            final = 400 <= e.code < 500 and e.code != 429 and e.code != 408
+            raise RequestFailed("%s %s -> HTTP %d" % (method, target, e.code),
+                                final)
+        except Exception as e:  # network errors, timeouts, bad JSON
+            raise RequestFailed("%s %s -> %s" % (method, target, e))
+    else:
+        raise RequestFailed("%s %s -> too many redirects" % (method, url))
+
+    if resp.get("error"):
+        raise AuthError("%s: %s" % (resp.get("error"), resp.get("error_msg")))
+    if "data" not in resp:
+        raise RequestFailed("Unexpected response: keys %s" % sorted(resp))
+
+    expect = b64e(hmac.new(prof.sync_secret,
+                           (resp["data"] + "&" + resp["nonce"]).encode(),
+                           hashlib.sha512).digest())
+    if not hmac.compare_digest(expect, resp.get("signature", "")):
+        raise RequestFailed("Response signature invalid")
+    plain = box.decrypt(b64d(resp["data"]), b64d(resp["nonce"]))
+    return json.loads(plain.decode())
+
+
+def device_info():
+    try:
+        with open(DEVICE_ID_PATH) as f:
+            device_id = f.read().strip()
+    except OSError:
+        device_id = uuid.uuid4().hex
+        try:
+            with open(DEVICE_ID_PATH, "w") as f:
+                f.write(device_id)
+        except OSError:
+            pass
+    try:
+        name = subprocess.check_output(
+            ["/usr/sbin/scutil", "--get", "ComputerName"], text=True).strip()
+    except Exception:
+        name = os.uname().nodename
+    mac = ""
+    try:
+        out = subprocess.check_output(["/sbin/ifconfig", "en0"], text=True)
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("ether "):
+                mac = line.split()[1]
+    except Exception:
+        pass
+    return device_id, name, mac
+
+
+def base_box(wg_pub):
+    device_id, name, mac = device_info()
+    return {
+        "device_id": device_id,
+        "device_name": name,
+        "device_key": "",
+        "device_hostname": os.uname().nodename,
+        "platform": "mac",
+        "client_ver": "pritunl-wg-" + VERSION,
+        "mac_addr": mac,
+        "mac_addrs": [mac] if mac else [],
+        "token": rand_str(16),
+        "token_public_key": "",
+        "token_signature": "",
+        "nonce": rand_str(16),
+        "password": "",
+        "timestamp": int(time.time()),
+        "wg_public_key": wg_pub,
+        "public_address": "",
+        "public_address6": "",
+        "sso_token": "",
+    }
+
+
+def register(prof, wg_pub):
+    last = None
+    for host in prof.api_hosts():
+        url = "https://%s%s" % (host, prof.path())
+        try:
+            data = enc_request(prof, "POST", url, base_box(wg_pub))
+        except RequestFailed as e:
+            log.warning("Register via %s failed: %s", host, e)
+            last = e
+            continue
+        if not data.get("allow"):
+            raise AuthError("Server refused connection: %s" % data.get("reason"))
+        return data["configuration"]
+    raise last or RequestFailed("No API hosts in profile")
+
+
+def keepalive(prof, conf, wg_pub):
+    scheme = "http" if conf.get("web_no_ssl") else "https"
+    gw = conf["gateway"]
+    url = "%s://%s:%d%s" % (scheme, gw, int(conf.get("web_port") or 443),
+                            prof.path())
+    box = base_box(wg_pub)
+    data = enc_request(prof, "PUT", url, box, timeout=10)
+    return bool(data.get("status"))
+
+
+# ---------------------------------------------------------------- tunnel
+
+def build_wg_conf(conf, priv64):
+    allowed = []
+    for key in ("routes", "routes6"):
+        for r in conf.get(key) or []:
+            if r.get("net_gateway"):
+                continue  # "exclude from VPN" routes, same as official client
+            if r["network"] not in allowed:
+                allowed.append(r["network"])
+    # Keepalives go to the gateway through the tunnel: make sure it's routed.
+    gw = ipaddress.ip_address(conf["gateway"])
+    if not any(gw in ipaddress.ip_network(n, strict=False) for n in allowed
+               if ipaddress.ip_network(n, strict=False).version == gw.version):
+        allowed.append("%s/%d" % (gw, 32 if gw.version == 4 else 128))
+
+    addrs = [conf["address"]]
+    if conf.get("address6"):
+        addrs.append(conf["address6"])
+
+    host = conf["hostname"]
+    if ":" in host:
+        host = "[%s]" % host
+    lines = [
+        "[Interface]",
+        "PrivateKey = %s" % priv64,
+        "Address = %s" % ", ".join(addrs),
+    ]
+    if conf.get("mtu"):
+        lines.append("MTU = %d" % int(conf["mtu"]))
+    dns = list(conf.get("dns_servers") or []) + list(conf.get("search_domains") or [])
+    if dns:
+        lines.append("DNS = %s" % ", ".join(dns))
+    lines += [
+        "",
+        "[Peer]",
+        "PublicKey = %s" % conf["public_key"],
+        "AllowedIPs = %s" % ", ".join(allowed),
+        "Endpoint = %s:%d" % (host, int(conf["port"])),
+        "PersistentKeepalive = 25",
+        "",
+    ]
+    return "\n".join(lines), allowed
+
+
+def wg_quick(action):
+    bash = find_brew_bin("bash")
+    wgq = find_brew_bin("wg-quick")
+    env = dict(os.environ)
+    env["PATH"] = ":".join([os.path.join(p, "bin") for p in BREW_PREFIXES] +
+                           ["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+    env.setdefault("HOME", "/var/root")
+    p =subprocess.run([bash, wgq, action, WG_CONF_PATH], env=env,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in p.stdout.splitlines():
+        log.debug("wg-quick %s: %s", action, line)
+    return p.returncode, p.stdout
+
+
+def tunnel_down(quiet=True):
+    if not os.path.exists(WG_CONF_PATH):
+        return
+    rc, out = wg_quick("down")
+    if rc != 0 and not quiet:
+        log.warning("wg-quick down failed: %s", out.strip())
+    try:
+        os.remove(WG_CONF_PATH)
+    except OSError:
+        pass
+
+
+def tunnel_up(conf, priv64):
+    text, allowed = build_wg_conf(conf, priv64)
+    os.makedirs(CONF_DIR, mode=0o700, exist_ok=True)
+    fd = os.open(WG_CONF_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    rc, out = wg_quick("up")
+    if rc != 0:
+        raise RequestFailed("wg-quick up failed: %s" % out.strip())
+    return allowed
+
+
+# ---------------------------------------------------------------- main loop
+
+STOP = False
+
+
+def _stop(signum, frame):
+    global STOP
+    STOP = True
+
+
+def sleep_interruptible(seconds):
+    end = time.monotonic() + seconds
+    while not STOP and time.monotonic() < end:
+        time.sleep(min(0.5, end - time.monotonic()))
+
+
+def session(prof):
+    """One connection: register key, bring tunnel up, keep alive until failure."""
+    wg_priv = PrivateKey.generate()
+    priv64 = b64e(bytes(wg_priv))
+    pub64 = b64e(bytes(wg_priv.public_key))
+
+    write_status(state="connecting", server=prof.server_name, user=prof.user)
+    log.info("Registering new WireGuard key with %s", prof.server_name)
+    conf = register(prof, pub64)
+    tunnel_down()
+    allowed = tunnel_up(conf, priv64)
+    log.info("Tunnel up: address %s, endpoint %s:%s, routes %s, dns %s",
+             conf.get("address"), conf.get("hostname"), conf.get("port"),
+             ",".join(allowed), ",".join(conf.get("dns_servers") or []))
+
+    interval = int(conf.get("ping_interval") or 15)
+    interval = max(interval, 5)
+    timeout = int(conf.get("ping_timeout") or 120)
+    since = int(time.time())
+    last_ok = time.monotonic()
+    last_ok_wall = time.time()
+    connected = False
+
+    # First keepalive shortly after start; this also confirms the tunnel works.
+    sleep_interruptible(2)
+    while not STOP:
+        wall0, mono0 = time.time(), time.monotonic()
+        try:
+            ok = keepalive(prof, conf, pub64)
+            if not ok:
+                log.warning("Server no longer knows this key; reconnecting")
+                return
+            last_ok = time.monotonic()
+            last_ok_wall = time.time()
+            if not connected:
+                connected = True
+                log.info("Connected")
+            write_status(state="connected", server=prof.server_name,
+                         user=prof.user, address=conf.get("address"),
+                         since=since, last_keepalive=int(last_ok_wall))
+        except RequestFailed as e:
+            if e.final:
+                log.warning("Keepalive rejected (%s); reconnecting", e)
+                return
+            log.info("Keepalive failed: %s", e)
+            if time.monotonic() - last_ok > timeout:
+                log.warning("No keepalive for %ds; reconnecting", timeout)
+                return
+
+        sleep_interruptible(interval + random.random() * 2)
+
+        # Laptop slept? The monotonic clock stops during sleep, wall time doesn't.
+        slept = (time.time() - wall0) - (time.monotonic() - mono0)
+        if slept > 30 or time.time() - last_ok_wall > timeout + 30:
+            log.info("System was asleep for ~%ds; reconnecting", int(slept))
+            return
+
+
+def cmd_run(_args):
+    if os.geteuid() != 0:
+        raise SystemExit("run must be executed as root (sudo)")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    prof = Profile(PROFILE_PATH)
+    log.info("pritunl-wg %s starting for %s on %s", VERSION, prof.user,
+             prof.server_name)
+    tunnel_down()  # clean up leftovers from a crash
+    backoff = 3
+    while not STOP:
+        try:
+            session(prof)
+            backoff = 3
+        except AuthError as e:
+            log.error("%s", e)
+            write_status(state="error", error=str(e), server=prof.server_name)
+            backoff = 300
+        except RequestFailed as e:
+            log.warning("Connection attempt failed: %s", e)
+            write_status(state="retrying", error=str(e), server=prof.server_name)
+        except Exception as e:
+            log.exception("Unexpected error: %s", e)
+            write_status(state="retrying", error=str(e), server=prof.server_name)
+        tunnel_down()
+        if STOP:
+            break
+        sleep_interruptible(backoff)
+        backoff = min(backoff * 2, 60) if backoff < 300 else 300
+    tunnel_down(quiet=False)
+    write_status(state="disconnected", server=getattr(prof, "server_name", ""))
+    log.info("Stopped")
+
+
+# ---------------------------------------------------------------- service mgmt
+
+def need_root():
+    if os.geteuid() != 0:
+        raise SystemExit("Please run with sudo")
+
+
+def launchctl(*args):
+    return subprocess.run(["/bin/launchctl"] + list(args),
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True)
+
+
+def service_loaded():
+    return launchctl("print", "system/" + LABEL).returncode == 0
+
+
+def cmd_up(_args):
+    need_root()
+    if not os.path.exists(PROFILE_PATH):
+        raise SystemExit("No profile at %s (run install.sh first)" % PROFILE_PATH)
+    launchctl("enable", "system/" + LABEL)
+    if service_loaded():
+        launchctl("kickstart", "-k", "system/" + LABEL)
+    else:
+        r = launchctl("bootstrap", "system", PLIST_PATH)
+        if r.returncode != 0:
+            raise SystemExit("launchctl bootstrap failed: " + r.stdout)
+    print("VPN starting - check with: pritunl-wg status")
+
+
+def cmd_down(_args):
+    need_root()
+    if service_loaded():
+        launchctl("bootout", "system/" + LABEL)
+    launchctl("disable", "system/" + LABEL)
+    # In case it was started by hand / crashed:
+    if os.path.exists(WG_CONF_PATH):
+        tunnel_down(quiet=False)
+    write_status(state="disconnected")
+    print("VPN stopped")
+
+
+def cmd_status(_args):
+    try:
+        with open(STATUS_PATH) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {"state": "disconnected"}
+    running = service_loaded() if os.geteuid() == 0 else None
+    state = st.get("state", "unknown")
+    if state != "disconnected" and time.time() - st.get("updated", 0) > 300:
+        state += " (stale - service may not be running)"
+    print("State:   %s" % state)
+    for k, label in (("server", "Server"), ("address", "Address"),
+                     ("error", "Error")):
+        if st.get(k):
+            print("%-8s %s" % (label + ":", st[k]))
+    if st.get("since"):
+        print("Since:   %s" % time.strftime("%Y-%m-%d %H:%M:%S",
+                                            time.localtime(st["since"])))
+    if st.get("last_keepalive"):
+        print("Last OK: %ds ago" % int(time.time() - st["last_keepalive"]))
+    if running is not None:
+        print("Service: %s" % ("running" if running else "stopped"))
+
+
+def cmd_log(_args):
+    os.execvp("tail", ["tail", "-n", "50", "-F", LOG_PATH])
+
+
+def main():
+    ap = argparse.ArgumentParser(description="WireGuard client for Pritunl")
+    sub = ap.add_subparsers(dest="cmd")
+    for name, fn, hlp in (
+            ("up", cmd_up, "start the VPN service"),
+            ("down", cmd_down, "stop the VPN service"),
+            ("status", cmd_status, "show status"),
+            ("log", cmd_log, "follow the log"),
+            ("run", cmd_run, "run in the foreground (as root)")):
+        p = sub.add_parser(name, help=hlp)
+        p.set_defaults(fn=fn)
+    args = ap.parse_args()
+    if not getattr(args, "fn", None):
+        ap.print_help()
+        return 1
+    args.fn(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
