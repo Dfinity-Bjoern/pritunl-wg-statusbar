@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 
 class MenuController: NSObject, NSMenuDelegate {
     private let statusItem: NSStatusItem
@@ -12,6 +13,7 @@ class MenuController: NSObject, NSMenuDelegate {
     private let toggleItem       = NSMenuItem()
     private let statsItem        = NSMenuItem()
     private let passwordlessItem = NSMenuItem()
+    private let loginItem        = NSMenuItem()
 
     init(statusItem: NSStatusItem, statusManager: StatusManager, vpnController: VPNController) {
         self.statusItem = statusItem
@@ -52,6 +54,10 @@ class MenuController: NSObject, NSMenuDelegate {
         passwordlessItem.target = self
         passwordlessItem.action = #selector(enablePasswordless)
         menu.addItem(passwordlessItem)
+
+        loginItem.target = self
+        loginItem.action = #selector(toggleLaunchAtLogin)
+        menu.addItem(loginItem)
 
         menu.addItem(.separator())
 
@@ -142,6 +148,23 @@ class MenuController: NSObject, NSMenuDelegate {
             passwordlessItem.title = "Enable Passwordless Connect…"
             passwordlessItem.isEnabled = true
             passwordlessItem.action = #selector(enablePasswordless)
+        }
+
+        let enabled = SMAppService.mainApp.status == .enabled
+        loginItem.title = "Launch at Login"
+        loginItem.state = enabled ? .on : .off
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            alert("Could not change login item: \(error.localizedDescription)")
         }
     }
 
